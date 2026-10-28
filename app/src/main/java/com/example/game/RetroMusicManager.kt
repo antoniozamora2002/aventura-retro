@@ -48,6 +48,7 @@ class RetroMusicManager(private val context: Context) {
     var selectedTheme: MusicTrackTheme = MusicTrackTheme.AUTO_LEVEL
         private set
 
+    private var isAppInBackground: Boolean = false
     private var currentGameState: GameState = GameState.MENU
     private var currentLevelType: LevelType = LevelType.VALLE
     private var activeTrackKey: String? = null
@@ -68,6 +69,18 @@ class RetroMusicManager(private val context: Context) {
         syncWithGameContext(currentGameState, currentLevelType, forceReload = true)
     }
 
+    fun onAppBackgrounded() {
+        isAppInBackground = true
+        pausePlayback()
+    }
+
+    fun onAppForegrounded() {
+        isAppInBackground = false
+        if (isEnabled) {
+            syncWithGameContext(currentGameState, currentLevelType, forceReload = false)
+        }
+    }
+
     fun syncWithGameContext(
         gameState: GameState,
         levelType: LevelType,
@@ -85,7 +98,7 @@ class RetroMusicManager(private val context: Context) {
             else -> "Valle Esmeralda (16-Bit)"
         }
 
-        if (!isEnabled) {
+        if (!isEnabled || isAppInBackground) {
             pausePlayback()
             return
         }
@@ -118,7 +131,7 @@ class RetroMusicManager(private val context: Context) {
             val file = withContext(Dispatchers.IO) {
                 ensureTrackFile(targetKey)
             }
-            if (activeTrackKey == targetKey && file != null && file.exists()) {
+            if (!isAppInBackground && activeTrackKey == targetKey && file != null && file.exists()) {
                 startMediaPlayer(file)
             }
         }
@@ -166,7 +179,7 @@ class RetroMusicManager(private val context: Context) {
     private fun startMediaPlayer(file: File) {
         try {
             releaseMediaPlayer()
-            if (!isEnabled) return
+            if (!isEnabled || isAppInBackground) return
 
             val player = MediaPlayer()
             player.setAudioAttributes(
@@ -189,14 +202,14 @@ class RetroMusicManager(private val context: Context) {
     }
 
     private fun updatePlaybackState() {
-        if (!isEnabled) {
+        if (!isEnabled || isAppInBackground) {
             pausePlayback()
         } else {
             syncWithGameContext(currentGameState, currentLevelType, forceReload = false)
         }
     }
 
-    private fun pausePlayback() {
+    fun pausePlayback() {
         try {
             if (mediaPlayer?.isPlaying == true) {
                 mediaPlayer?.pause()

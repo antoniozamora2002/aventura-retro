@@ -1,5 +1,6 @@
 package com.example.game
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -39,6 +40,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.delay
 import kotlin.math.cos
 import kotlin.math.sin
@@ -46,37 +50,96 @@ import kotlin.random.Random
 
 @Composable
 fun GameScreen(modifier: Modifier = Modifier) {
-    // SharedPreferences to persist local high score
+    // SharedPreferences to persist records, coins, skins, and settings
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val prefs = remember { context.getSharedPreferences("retro_aventura_scores", android.content.Context.MODE_PRIVATE) }
-    
+
     // Core game state
     var gameState by remember { mutableStateOf(GameState.MENU) }
-    val engine = remember { GameEngine() }
+    val engine = remember {
+        GameEngine().apply {
+            val savedHighScore = prefs.getInt("high_score", 0)
+            playerHighscore = savedHighScore
+            playerCoins = if (prefs.contains("accumulated_coins")) {
+                prefs.getInt("accumulated_coins", 0)
+            } else {
+                savedHighScore
+            }
+            val savedSkinId = prefs.getString("equipped_skin_id", "ciber") ?: "ciber"
+            equipSkin(savedSkinId)
+        }
+    }
     val soundManager = remember { RetroSoundManager(context) }
     val musicManager = remember { RetroMusicManager(context) }
 
     // Active navigation tab
     var activeTab by remember { mutableStateOf("Jugar") }
-    
+
     // Saved skins persistence - read & write
-    var unlockedSkins by remember { 
+    var unlockedSkins by remember {
         mutableStateOf(
-            prefs.getStringSet("unlocked_skins", setOf("ciber")) ?: setOf("ciber")
-        ) 
+            prefs.getStringSet("unlocked_skins", setOf("ciber"))?.toSet() ?: setOf("ciber")
+        )
     }
-    
-    // Custom slider factor values
-    var gravityFactor by remember { mutableStateOf(1.0f) }
-    var speedFactor by remember { mutableStateOf(1.0f) }
-    var jumpFactor by remember { mutableStateOf(1.0f) }
-    var soundEffectsEnabled by remember { mutableStateOf(true) }
-    var soundVolume by remember { mutableStateOf(0.85f) }
-    var musicEnabled by remember { mutableStateOf(true) }
-    var musicVolume by remember { mutableStateOf(0.65f) }
-    var selectedMusicTheme by remember { mutableStateOf(MusicTrackTheme.AUTO_LEVEL) }
+
+    // Persisted slider & audio settings
+    var gravityFactor by remember { mutableFloatStateOf(prefs.getFloat("pref_gravity_factor", 1.0f)) }
+    var speedFactor by remember { mutableFloatStateOf(prefs.getFloat("pref_speed_factor", 1.0f)) }
+    var jumpFactor by remember { mutableFloatStateOf(prefs.getFloat("pref_jump_factor", 1.0f)) }
+    var soundEffectsEnabled by remember { mutableStateOf(prefs.getBoolean("pref_sfx_enabled", true)) }
+    var soundVolume by remember { mutableFloatStateOf(prefs.getFloat("pref_sfx_volume", 0.85f)) }
+    var musicEnabled by remember { mutableStateOf(prefs.getBoolean("pref_music_enabled", true)) }
+    var musicVolume by remember { mutableFloatStateOf(prefs.getFloat("pref_music_volume", 0.65f)) }
+    var selectedMusicTheme by remember {
+        val savedThemeId = prefs.getString("pref_music_theme", MusicTrackTheme.AUTO_LEVEL.id)
+        val initialTheme = MusicTrackTheme.entries.find { it.id == savedThemeId } ?: MusicTrackTheme.AUTO_LEVEL
+        mutableStateOf(initialTheme)
+    }
     var activeTrackName by remember { mutableStateOf(musicManager.activeTrackDisplayName) }
-    var fpsOverlayEnabled by remember { mutableStateOf(true) }
+    var fpsOverlayEnabled by remember { mutableStateOf(prefs.getBoolean("pref_fps_overlay", true)) }
+    var currentFps by remember { mutableIntStateOf(60) }
+
+    // Control Android Back button: pause during gameplay, return to Menu from overlays, or return to "Jugar" tab
+    BackHandler(enabled = activeTab != "Jugar" || gameState != GameState.MENU) {
+        when {
+            activeTab != "Jugar" -> {
+                activeTab = "Jugar"
+            }
+            gameState == GameState.PLAYING -> {
+                engine.releaseLeft()
+                engine.releaseRight()
+                gameState = GameState.PAUSED
+            }
+            gameState == GameState.PAUSED || gameState == GameState.GAME_OVER || gameState == GameState.VICTORY -> {
+                gameState = GameState.MENU
+            }
+        }
+    }
+
+    // Pause game and MediaPlayer when the app goes to background (ON_PAUSE / ON_STOP)
+    DisposableEffect(lifecycleOwner, musicManager, engine) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> {
+                    engine.releaseLeft()
+                    engine.releaseRight()
+                    if (gameState == GameState.PLAYING) {
+                        gameState = GameState.PAUSED
+                    }
+                    musicManager.onAppBackgrounded()
+                }
+                Lifecycle.Event.ON_RESUME -> {
+                    musicManager.onAppForegrounded()
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     // Bind GameEngine sound events to low-latency SoundPool manager and release audio resources on dispose
     DisposableEffect(soundManager, musicManager, engine) {
@@ -93,12 +156,24 @@ fun GameScreen(modifier: Modifier = Modifier) {
     LaunchedEffect(soundEffectsEnabled, soundVolume) {
         soundManager.isEnabled = soundEffectsEnabled
         soundManager.volume = soundVolume
+        prefs.edit()
+            .putBoolean("pref_sfx_enabled", soundEffectsEnabled)
+            .putFloat("pref_sfx_volume", soundVolume)
+            .apply()
     }
 
-    LaunchedEffect(musicEnabled, musicVolume) {
+    LaunchedEffect(musicEnabled, musicVolume, selectedMusicTheme) {
         musicManager.isEnabled = musicEnabled
         musicManager.volume = musicVolume
+        if (musicManager.selectedTheme != selectedMusicTheme) {
+            musicManager.selectTheme(selectedMusicTheme)
+        }
         activeTrackName = musicManager.activeTrackDisplayName
+        prefs.edit()
+            .putBoolean("pref_music_enabled", musicEnabled)
+            .putFloat("pref_music_volume", musicVolume)
+            .putString("pref_music_theme", selectedMusicTheme.id)
+            .apply()
     }
 
     // Automatically synchronize background music with game state and active level
@@ -107,21 +182,36 @@ fun GameScreen(modifier: Modifier = Modifier) {
         activeTrackName = musicManager.activeTrackDisplayName
     }
 
-    // Read Initial persistence values
-    LaunchedEffect(Unit) {
-        engine.playerHighscore = prefs.getInt("high_score", 0)
-    }
-
-    // Write back when high score updates
+    // Persist high score updates (never decreases)
     LaunchedEffect(engine.playerHighscore) {
         prefs.edit().putInt("high_score", engine.playerHighscore).apply()
     }
 
-    // Apply Factor adjustments to Engine dynamics on tick
+    // Persist accumulated coins wallet
+    LaunchedEffect(engine.playerCoins) {
+        prefs.edit().putInt("accumulated_coins", engine.playerCoins).apply()
+    }
+
+    // Persist equipped skin ID
+    LaunchedEffect(engine.activeSkinId) {
+        prefs.edit().putString("equipped_skin_id", engine.activeSkinId).apply()
+    }
+
+    // Persist FPS overlay toggle
+    LaunchedEffect(fpsOverlayEnabled) {
+        prefs.edit().putBoolean("pref_fps_overlay", fpsOverlayEnabled).apply()
+    }
+
+    // Apply and persist physics factor adjustments
     LaunchedEffect(gravityFactor, speedFactor, jumpFactor) {
         engine.gravity = 0.8f * gravityFactor
         engine.walkSpeed = 7.5f * speedFactor
         engine.jumpPower = -17f * jumpFactor
+        prefs.edit()
+            .putFloat("pref_gravity_factor", gravityFactor)
+            .putFloat("pref_speed_factor", speedFactor)
+            .putFloat("pref_jump_factor", jumpFactor)
+            .apply()
     }
 
     // Active pulse/bobbing for animations
@@ -136,12 +226,19 @@ fun GameScreen(modifier: Modifier = Modifier) {
         label = "logo"
     )
 
-    // Core Game loop (60 FPS tick)
-    LaunchedEffect(Unit) {
-        while (true) {
-            if (gameState == GameState.PLAYING) {
-                engine.updatePhysics()
-                
+    // Frame-rate independent Game Loop using real elapsed delta time
+    LaunchedEffect(gameState) {
+        if (gameState == GameState.PLAYING) {
+            var lastTimeNanos = System.nanoTime()
+            while (gameState == GameState.PLAYING) {
+                delay(16L)
+                val nowNanos = System.nanoTime()
+                val rawDeltaSec = (nowNanos - lastTimeNanos) / 1_000_000_000f
+                lastTimeNanos = nowNanos
+                val deltaSeconds = if (rawDeltaSec <= 0.0001f) (1f / 60f) else rawDeltaSec.coerceIn(1f / 240f, 0.1f)
+                currentFps = (1f / deltaSeconds).toInt().coerceIn(1, 240)
+                engine.updatePhysics(deltaSeconds)
+
                 // Switch gameover/victory states
                 if (engine.playerLives <= 0) {
                     gameState = GameState.GAME_OVER
@@ -149,7 +246,6 @@ fun GameScreen(modifier: Modifier = Modifier) {
                     gameState = GameState.VICTORY
                 }
             }
-            delay(16L) // stable 60 fps
         }
     }
 
@@ -160,8 +256,6 @@ fun GameScreen(modifier: Modifier = Modifier) {
             .fillMaxSize()
             .background(if (isPlayingOrOverlay) Color(0xFF1A1C1E) else Color(0xFFFEF7FF))
     ) {
-        // Redundant simulated status bar and bottom pill wrapping omitted under real landscape flow to maximize content height!
-
         // 1. App Bar Header Section - only show if NOT actively playing/overlay
         if (!isPlayingOrOverlay) {
             Row(
@@ -188,7 +282,7 @@ fun GameScreen(modifier: Modifier = Modifier) {
                             Text(text = "◀", color = Color(0xFF1D1B20), fontSize = 12.sp)
                         }
                     }
-                    
+
                     Column {
                         Text(
                             text = "Aventura Retro",
@@ -209,7 +303,7 @@ fun GameScreen(modifier: Modifier = Modifier) {
                     }
                 }
 
-                // Right side: Active music badge/toggle + High score badge
+                // Right side: Active music badge/toggle + Coins badge + High score badge
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -238,6 +332,19 @@ fun GameScreen(modifier: Modifier = Modifier) {
                             maxLines = 1
                         )
                     }
+
+                    // Spendable Coins badge
+                    Text(
+                        text = "🪙 ${engine.playerCoins}",
+                        color = Color(0xFF5D4037),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier
+                            .background(Color(0xFFFFD54F).copy(alpha = 0.28f), RoundedCornerShape(12.dp))
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                            .testTag("header_coins_badge")
+                    )
 
                     // Show high score dynamic badge in App bar
                     Text(
@@ -340,6 +447,7 @@ fun GameScreen(modifier: Modifier = Modifier) {
                             HUDView(
                                 engine = engine,
                                 fpsOverlayEnabled = fpsOverlayEnabled,
+                                currentFps = currentFps,
                                 musicEnabled = musicEnabled,
                                 onToggleMusic = { musicEnabled = !musicEnabled },
                                 onPause = { gameState = GameState.PAUSED }
@@ -413,14 +521,18 @@ fun GameScreen(modifier: Modifier = Modifier) {
                         engine = engine,
                         unlockedSkins = unlockedSkins,
                         onSkinUnlocked = { skinId, price ->
-                            soundManager.play(RetroSoundEffect.POWERUP)
-                            val updated = unlockedSkins.toMutableSet().apply { add(skinId) }
-                            unlockedSkins = updated
-                            prefs.edit().putStringSet("unlocked_skins", updated).apply()
-                            
-                            if (engine.playerHighscore >= price) {
-                                engine.playerHighscore -= price
-                                prefs.edit().putInt("high_score", engine.playerHighscore).apply()
+                            // Validate balance FIRST using separate accumulated coins wallet (never touching highScore)
+                            if (!unlockedSkins.contains(skinId) && engine.playerCoins >= price) {
+                                engine.playerCoins -= price
+                                prefs.edit().putInt("accumulated_coins", engine.playerCoins).apply()
+
+                                val updated = unlockedSkins.toMutableSet().apply { add(skinId) }
+                                unlockedSkins = updated
+                                prefs.edit().putStringSet("unlocked_skins", updated).apply()
+
+                                engine.equipSkin(skinId)
+                                prefs.edit().putString("equipped_skin_id", skinId).apply()
+                                soundManager.play(RetroSoundEffect.POWERUP)
                             }
                         }
                     )
@@ -1417,6 +1529,7 @@ fun DrawScope.drawFloatingText(floatingText: FloatingText, scale: Float) {
 fun HUDView(
     engine: GameEngine,
     fpsOverlayEnabled: Boolean = false,
+    currentFps: Int = 60,
     musicEnabled: Boolean = true,
     onToggleMusic: () -> Unit = {},
     onPause: () -> Unit = {}
@@ -1510,20 +1623,36 @@ fun HUDView(
             )
         }
 
-        // Right: Compact single-line Score + FPS + Pause button
+        // Right: Compact single-line Coins + Score + FPS + Pause button
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             if (fpsOverlayEnabled) {
                 Text(
-                    text = "60 FPS",
+                    text = "$currentFps FPS",
                     color = Color.White.copy(alpha = 0.65f),
                     fontSize = 8.sp,
                     fontFamily = FontFamily.Monospace,
                     modifier = Modifier
                         .background(Color(0x55000000), RoundedCornerShape(50))
                         .padding(horizontal = 6.dp, vertical = 3.dp)
+                )
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .background(Color(0x66000000), RoundedCornerShape(50))
+                    .border(1.dp, Color(0xFFFFD700).copy(alpha = 0.25f), RoundedCornerShape(50))
+                    .padding(horizontal = 8.dp, vertical = 3.dp)
+            ) {
+                Text(
+                    text = "🪙 ${engine.playerCoins}",
+                    color = Color(0xFFFFEA00),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
                 )
             }
 
@@ -2244,29 +2373,13 @@ fun LevelsTabScreen(engine: GameEngine, onSelectLevel: () -> Unit) {
     }
 }
 
-data class CharacterSkin(
-    val id: String,
-    val name: String,
-    val color: Color,
-    val cost: Int,
-    val description: String,
-    val emoji: String
-)
-
 @Composable
 fun SkinsShopTabScreen(
     engine: GameEngine,
     unlockedSkins: Set<String>,
     onSkinUnlocked: (String, Int) -> Unit
 ) {
-    val skins = remember {
-        listOf(
-            CharacterSkin("ciber", "Astronauta Ciber", Color(0xFF00FFFF), 0, "Traje cibernético estándar para expediciones siderales.", "👨‍🚀"),
-            CharacterSkin("rosa", "Cristal Rosa", Color(0xFFFF007F), 100, "Refinado del Bosque de Cristales del Nivel 1.", "🔮"),
-            CharacterSkin("sola", "Fuego Solar", Color(0xFFFF5722), 250, "Irradia energía de la corona solar.", "🔥"),
-            CharacterSkin("oro", "Oro Cósmico", Color(0xFFFFD700), 500, "La armadura más refinada y lujosa de la galaxia.", "👑")
-        )
-    }
+    val skins = remember { AVAILABLE_SKINS }
 
     Column(
         modifier = Modifier
@@ -2276,7 +2389,7 @@ fun SkinsShopTabScreen(
             .padding(horizontal = 24.dp, vertical = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // High score indicator representing funds
+        // Accumulated Coins wallet indicator (separate from high score!)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -2289,24 +2402,25 @@ fun SkinsShopTabScreen(
         ) {
             Column {
                 Text(
-                    text = "CRÉDITOS DISPONIBLES",
+                    text = "MONEDAS ACUMULADAS",
                     color = Color(0xFF00F0FF),
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace
                 )
                 Text(
-                    text = "Basado en tu récord máximo",
-                    color = Color.White.copy(alpha = 0.6f),
+                    text = "Récord Máximo intacto: 🏆 ${engine.playerHighscore} PTOS",
+                    color = Color.White.copy(alpha = 0.65f),
                     fontSize = 11.sp
                 )
             }
             Text(
-                text = "${engine.playerHighscore} PTOS",
+                text = "🪙 ${engine.playerCoins}",
                 color = Color(0xFFFFEB3B),
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Black,
-                fontFamily = FontFamily.Monospace
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier.testTag("shop_coins_balance")
             )
         }
 
@@ -2325,8 +2439,8 @@ fun SkinsShopTabScreen(
         ) {
             skins.forEach { skin ->
                 val isUnlocked = unlockedSkins.contains(skin.id)
-                val isEquipped = engine.activeSkinColor == skin.color
-                
+                val isEquipped = engine.activeSkinId == skin.id
+
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(
@@ -2373,14 +2487,14 @@ fun SkinsShopTabScreen(
                         if (isUnlocked) {
                             Button(
                                 onClick = {
-                                    engine.activeSkinColor = skin.color
-                                    engine.activeSkinName = skin.name
+                                    engine.equipSkin(skin.id)
                                 },
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = if (isEquipped) Color(0xFF39FF14) else Color(0x33FFFFFF)
                                 ),
                                 shape = RoundedCornerShape(8.dp),
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                modifier = Modifier.testTag("equip_skin_${skin.id}")
                             ) {
                                 Text(
                                     text = if (isEquipped) "EQUIPADO" else "EQUIPAR",
@@ -2390,7 +2504,7 @@ fun SkinsShopTabScreen(
                                 )
                             }
                         } else {
-                            val canAfford = engine.playerHighscore >= skin.cost
+                            val canAfford = engine.playerCoins >= skin.cost
                             Button(
                                 onClick = {
                                     if (canAfford) {
@@ -2403,10 +2517,11 @@ fun SkinsShopTabScreen(
                                     disabledContainerColor = Color(0x33FFFFFF)
                                 ),
                                 shape = RoundedCornerShape(8.dp),
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                modifier = Modifier.testTag("buy_skin_${skin.id}")
                             ) {
                                 Text(
-                                    text = "${skin.cost} PTS",
+                                    text = "🪙 ${skin.cost}",
                                     color = if (canAfford) Color.Black else Color.White.copy(alpha = 0.4f),
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Black

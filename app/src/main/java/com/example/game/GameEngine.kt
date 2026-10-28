@@ -3,10 +3,11 @@ package com.example.game
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import kotlin.math.abs
+import kotlin.math.min
+import kotlin.math.pow
 import kotlin.random.Random
 
 enum class GameState {
@@ -36,6 +37,50 @@ enum class EnemyType {
     RED_DROID
 }
 
+data class CharacterSkin(
+    val id: String,
+    val name: String,
+    val color: Color,
+    val cost: Int,
+    val description: String,
+    val emoji: String
+)
+
+val AVAILABLE_SKINS = listOf(
+    CharacterSkin(
+        id = "ciber",
+        name = "Astronauta Ciber",
+        color = Color(0xFF00FFFF),
+        cost = 0,
+        description = "Traje cibernético estándar para expediciones siderales.",
+        emoji = "👨‍🚀"
+    ),
+    CharacterSkin(
+        id = "rosa",
+        name = "Cristal Rosa",
+        color = Color(0xFFFF007F),
+        cost = 100,
+        description = "Refinado del Bosque de Cristales del Nivel 1.",
+        emoji = "🔮"
+    ),
+    CharacterSkin(
+        id = "sola",
+        name = "Fuego Solar",
+        color = Color(0xFFFF5722),
+        cost = 250,
+        description = "Irradia energía de la corona solar.",
+        emoji = "🔥"
+    ),
+    CharacterSkin(
+        id = "oro",
+        name = "Oro Cósmico",
+        color = Color(0xFFFFD700),
+        cost = 500,
+        description = "La armadura más refinada y lujosa de la galaxia.",
+        emoji = "👑"
+    )
+)
+
 data class Platform(
     val rect: Rect,
     val color: Color,
@@ -48,12 +93,20 @@ data class Platform(
 ) {
     var currentOffset = 0f
     var direction = 1f
+    var lastDeltaX = 0f
+    var lastDeltaY = 0f
 
-    fun update(): Platform {
+    fun update(dtScale: Float = 1f): Platform {
         if (!movesHorizontally && !movesVertically) return this
-        val nextOffset = currentOffset + speed * direction
-        val newDirection = if (abs(nextOffset) >= travelRange) -direction else direction
-        
+        val step = speed * direction * dtScale
+        var nextOffset = currentOffset + step
+        var newDirection = direction
+        if (abs(nextOffset) >= travelRange) {
+            nextOffset = nextOffset.coerceIn(-travelRange, travelRange)
+            newDirection = -direction
+        }
+
+        val actualDelta = nextOffset - currentOffset
         val newRect = if (movesHorizontally) {
             Rect(
                 left = originalRect.left + nextOffset,
@@ -69,10 +122,12 @@ data class Platform(
                 bottom = originalRect.bottom + nextOffset
             )
         }
-        
+
         val updated = this.copy(rect = newRect)
         updated.currentOffset = nextOffset
         updated.direction = newDirection
+        updated.lastDeltaX = if (movesHorizontally) actualDelta else 0f
+        updated.lastDeltaY = if (movesVertically) actualDelta else 0f
         return updated
     }
 }
@@ -103,15 +158,15 @@ data class Enemy(
     val color: Color,
     var isDead: Boolean = false
 ) {
-    fun update() {
+    fun update(dtScale: Float = 1f) {
         if (isDead) return
-        x += vx
+        x += vx * dtScale
         if (x <= minX) {
             x = minX
-            vx = -vx
+            vx = abs(vx)
         } else if (x >= maxX - width) {
             x = maxX - width
-            vx = -vx
+            vx = -abs(vx)
         }
     }
 
@@ -128,14 +183,14 @@ data class Particle(
     val color: Color,
     val size: Float,
     val maxLife: Int,
-    var currentLife: Int = maxLife
+    var currentLife: Float = maxLife.toFloat()
 ) {
-    fun update(): Particle? {
-        if (currentLife <= 0) return null
+    fun update(dtScale: Float = 1f): Particle? {
+        if (currentLife <= 0f) return null
         return this.copy(
-            x = x + vx,
-            y = y + vy + 0.1f, // slight gravity
-            currentLife = currentLife - 1
+            x = x + vx * dtScale,
+            y = y + (vy + 0.1f * dtScale) * dtScale,
+            currentLife = currentLife - dtScale
         )
     }
 }
@@ -146,19 +201,19 @@ data class FloatingText(
     val y: Float,
     val color: Color,
     val maxLife: Int = 45,
-    var currentLife: Int = maxLife
+    var currentLife: Float = maxLife.toFloat()
 ) {
-    fun update(): FloatingText? {
-        if (currentLife <= 0) return null
+    fun update(dtScale: Float = 1f): FloatingText? {
+        if (currentLife <= 0f) return null
         return this.copy(
-            y = y - 1.5f, // floats upwards
-            currentLife = currentLife - 1
+            y = y - 1.5f * dtScale,
+            currentLife = currentLife - dtScale
         )
     }
 }
 
 class GameEngine {
-    // Engine constants
+    // Engine constants (calibrated at 60Hz baseline, scaled by delta time in updatePhysics)
     var gravity = 0.8f
     var jumpPower = -17f
     var walkSpeed = 7.5f
@@ -181,6 +236,8 @@ class GameEngine {
     var playerLives by mutableStateOf(3)
     var playerScore by mutableStateOf(0)
     var playerHighscore by mutableStateOf(0)
+    var playerCoins by mutableStateOf(0)
+    var activeSkinId by mutableStateOf("ciber")
     var activeSkinColor by mutableStateOf(Color(0xFF00FFFF))
     var activeSkinName by mutableStateOf("Astronauta Ciber")
     var doubleJumpAvailable by mutableStateOf(true)
@@ -189,14 +246,17 @@ class GameEngine {
 
     // Powers
     var tempGravityBootsTimer by mutableStateOf(0) // Timer for high jump mode
-    
+
+    // Fractional accumulator for 60Hz frame-counted timers (invincibility, boots, screen shake)
+    private var timerTickAccumulator = 0f
+
     // Level State
     var currentLevelIndex by mutableStateOf(0)
     var currentLevelType by mutableStateOf(LevelType.VALLE)
     var platforms = mutableListOf<Platform>()
     var collectibles = mutableListOf<Collectible>()
     var enemies = mutableListOf<Enemy>()
-    
+
     // Aesthetic feeds
     var particles = mutableListOf<Particle>()
     var floatingTexts = mutableListOf<FloatingText>()
@@ -213,6 +273,13 @@ class GameEngine {
 
     init {
         loadLevel(0)
+    }
+
+    fun equipSkin(skinId: String) {
+        val skin = AVAILABLE_SKINS.find { it.id == skinId } ?: AVAILABLE_SKINS.first()
+        activeSkinId = skin.id
+        activeSkinColor = skin.color
+        activeSkinName = skin.name
     }
 
     fun loadLevel(index: Int) {
@@ -232,6 +299,7 @@ class GameEngine {
         doubleJumpAvailable = true
         invincibilityFrames = 0
         tempGravityBootsTimer = 0
+        timerTickAccumulator = 0f
         cameraX = 0f
         cameraY = 150f
 
@@ -252,44 +320,48 @@ class GameEngine {
             0 -> { // Valle Esmeralda (Green nature / gentle)
                 levelGoalX = 4200f
                 // Starter ground
-                platforms.add(Platform(Rect(0f, 500f, 800f, 600f), Color(0xFF2E7D32))) // mosy grass green
-                
+                platforms.add(Platform(Rect(0f, 500f, 800f, 600f), Color(0xFF2E7D32)))
+
                 // Platforms
                 platforms.add(Platform(Rect(300f, 380f, 480f, 410f), Color(0xFF4CAF50)))
                 platforms.add(Platform(Rect(580f, 260f, 750f, 290f), Color(0xFF81C784)))
-                
+
                 // Gap platform
                 platforms.add(Platform(Rect(900f, 480f, 1300f, 600f), Color(0xFF2E7D32)))
                 platforms.add(Platform(Rect(1050f, 340f, 1180f, 370f), Color(0xFF4CAF50)))
-                
+
                 // Moving horizontally
-                platforms.add(Platform(
-                    rect = Rect(1450f, 400f, 1650f, 430f),
-                    color = Color(0xFFFF9800),
-                    movesHorizontally = true,
-                    travelRange = 120f,
-                    speed = 2.5f
-                ))
+                platforms.add(
+                    Platform(
+                        rect = Rect(1450f, 400f, 1650f, 430f),
+                        color = Color(0xFFFF9800),
+                        movesHorizontally = true,
+                        travelRange = 120f,
+                        speed = 2.5f
+                    )
+                )
 
                 platforms.add(Platform(Rect(1900f, 480f, 2400f, 600f), Color(0xFF2E7D32)))
                 // Some spikes in a pit
                 platforms.add(Platform(Rect(2100f, 450f, 2200f, 480f), Color(0xFFD32F2F), isSpiky = true))
 
                 // Vertical moving safety
-                platforms.add(Platform(
-                    rect = Rect(2550f, 420f, 2750f, 450f),
-                    color = Color(0xFFFF9800),
-                    movesVertically = true,
-                    travelRange = 100f,
-                    speed = 2f
-                ))
+                platforms.add(
+                    Platform(
+                        rect = Rect(2550f, 420f, 2750f, 450f),
+                        color = Color(0xFFFF9800),
+                        movesVertically = true,
+                        travelRange = 100f,
+                        speed = 2f
+                    )
+                )
 
                 platforms.add(Platform(Rect(2900f, 360f, 3100f, 390f), Color(0xFF81C784)))
                 platforms.add(Platform(Rect(3250f, 260f, 3450f, 290f), Color(0xFF4CAF50)))
-                
+
                 // Goal land
                 platforms.add(Platform(Rect(3700f, 450f, 4500f, 600f), Color(0xFF2E7D32)))
-                
+
                 // Collectibles (Coins & Diamonds)
                 addCoin(1, 350f, 330f)
                 addCoin(2, 400f, 330f)
@@ -297,16 +369,15 @@ class GameEngine {
                 addCoin(4, 630f, 210f)
                 addCoin(5, 700f, 210f)
                 addCoin(6, 1110f, 290f)
-                addCoin(7, 1550f, 340f) // hovering over moving platform
-                addDiamond(8, 2150f, 260f) // diamond high up over spikes!
+                addCoin(7, 1550f, 340f)
+                addDiamond(8, 2150f, 260f)
                 addCoin(9, 3000f, 300f)
                 addCoin(10, 3350f, 200f)
                 addCoin(11, 3900f, 390f)
                 addCoin(12, 4050f, 390f)
-                addHeart(13, 2000f, 420f) // Bonus heart!
+                addHeart(13, 2000f, 420f)
 
                 // Enemies (Slimes)
-                // Id, type, x, y, width, height, vx, minX, maxX, color
                 enemies.add(Enemy(101, EnemyType.GREEN_SLIME, 500f, 465f, 40f, 35f, 2f, 100f, 750f, Color(0xFF64DD17)))
                 enemies.add(Enemy(102, EnemyType.GREEN_SLIME, 1000f, 445f, 40f, 35f, 2.5f, 920f, 1260f, Color(0xFF64DD17)))
                 enemies.add(Enemy(103, EnemyType.GREEN_SLIME, 2050f, 445f, 40f, 35f, 3f, 1910f, 2380f, Color(0xFF64DD17)))
@@ -315,54 +386,57 @@ class GameEngine {
 
             1 -> { // Tempestad de Neón (Cyan & Purple cyberpunk night)
                 levelGoalX = 4300f
-                // Neon levels are darker, more vertical gap jumps, spikes, and fast moving platforms
-                // Spawn land
-                platforms.add(Platform(Rect(0f, 480f, 600f, 600f), Color(0xFF1A1A3A))) // cyber grey-blue
-                
-                // Diagonal platforms
-                platforms.add(Platform(Rect(350f, 360f, 500f, 385f), Color(0xFF00F0FF))) // Neon Cyan
-                platforms.add(Platform(Rect(580f, 250f, 730f, 275f), Color(0xFFFF007F))) // Neon Pink
-                
+                platforms.add(Platform(Rect(0f, 480f, 600f, 600f), Color(0xFF1A1A3A)))
+
+                platforms.add(Platform(Rect(350f, 360f, 500f, 385f), Color(0xFF00F0FF)))
+                platforms.add(Platform(Rect(580f, 250f, 730f, 275f), Color(0xFFFF007F)))
+
                 // Deep spikes pit with tiny safety islands
-                platforms.add(Platform(Rect(780f, 520f, 1500f, 600f), Color(0xFF9C27B0), isSpiky = true)) // Pink spikes bed
+                platforms.add(Platform(Rect(780f, 520f, 1500f, 600f), Color(0xFF9C27B0), isSpiky = true))
                 platforms.add(Platform(Rect(900f, 400f, 1000f, 420f), Color(0xFF00F0FF)))
                 platforms.add(Platform(Rect(1150f, 320f, 1250f, 340f), Color(0xFFFF007F)))
                 platforms.add(Platform(Rect(1380f, 400f, 1480f, 420f), Color(0xFF00F0FF)))
-                
+
                 // Platform scrolling horizontally quickly
-                platforms.add(Platform(
-                    rect = Rect(1620f, 460f, 1780f, 485f),
-                    color = Color(0xFFE040FB),
-                    movesHorizontally = true,
-                    travelRange = 180f,
-                    speed = 4f
-                ))
-                
+                platforms.add(
+                    Platform(
+                        rect = Rect(1620f, 460f, 1780f, 485f),
+                        color = Color(0xFFE040FB),
+                        movesHorizontally = true,
+                        travelRange = 180f,
+                        speed = 4f
+                    )
+                )
+
                 // Safe block in center
                 platforms.add(Platform(Rect(1950f, 420f, 2300f, 600f), Color(0xFF1A1A3A)))
                 platforms.add(Platform(Rect(2050f, 280f, 2200f, 305f), Color(0xFF00F0FF)))
-                
+
                 // Double vertical elevators
-                platforms.add(Platform(
-                    rect = Rect(2420f, 400f, 2550f, 420f),
-                    color = Color(0xFFFFEB3B),
-                    movesVertically = true,
-                    travelRange = 120f,
-                    speed = 3f
-                ))
-                platforms.add(Platform(
-                    rect = Rect(2700f, 250f, 2830f, 270f),
-                    color = Color(0xFFFFEB3B),
-                    movesVertically = true,
-                    travelRange = 120f,
-                    speed = -3f // opposite directions
-                ))
+                platforms.add(
+                    Platform(
+                        rect = Rect(2420f, 400f, 2550f, 420f),
+                        color = Color(0xFFFFEB3B),
+                        movesVertically = true,
+                        travelRange = 120f,
+                        speed = 3f
+                    )
+                )
+                platforms.add(
+                    Platform(
+                        rect = Rect(2700f, 250f, 2830f, 270f),
+                        color = Color(0xFFFFEB3B),
+                        movesVertically = true,
+                        travelRange = 120f,
+                        speed = -3f
+                    )
+                )
 
                 // Toxic hazard pit
                 platforms.add(Platform(Rect(2900f, 520f, 3500f, 600f), Color(0xFFFF007F), isSpiky = true))
                 platforms.add(Platform(Rect(3020f, 400f, 3140f, 420f), Color(0xFF00F0FF)))
                 platforms.add(Platform(Rect(3260f, 290f, 3380f, 310f), Color(0xFFFF007F)))
-                
+
                 // Landing ground
                 platforms.add(Platform(Rect(3650f, 460f, 4500f, 600f), Color(0xFF1A1A3A)))
 
@@ -371,21 +445,20 @@ class GameEngine {
                 addCoin(202, 450f, 310f)
                 addCoin(203, 610f, 200f)
                 addCoin(204, 680f, 200f)
-                
+
                 addDiamond(205, 950f, 350f)
                 addDiamond(206, 1200f, 270f)
                 addDiamond(207, 1430f, 350f)
-                
-                addGravityBoots(208, 2125f, 220f) // Boost powers up here!
+
+                addGravityBoots(208, 2125f, 220f)
                 addCoin(209, 2125f, 160f)
-                addCoin(210, 2125f, 100f) // Reachable with high jump boots!
-                
+                addCoin(210, 2125f, 100f)
+
                 addDiamond(211, 3080f, 340f)
                 addCoin(212, 3320f, 230f)
                 addHeart(213, 3750f, 400f)
 
                 // Enemies (Cyber turrets / droids)
-                // They patrol much faster!
                 enemies.add(Enemy(251, EnemyType.CYAN_TURRET, 250f, 440f, 42f, 40f, 3.5f, 50f, 580f, Color(0xFF00E5FF)))
                 enemies.add(Enemy(252, EnemyType.CYAN_TURRET, 2000f, 380f, 42f, 40f, 3.0f, 1960f, 2280f, Color(0xFF00E5FF)))
                 enemies.add(Enemy(253, EnemyType.CYAN_TURRET, 3800f, 420f, 42f, 40f, 4f, 3680f, 4400f, Color(0xFFFF1744)))
@@ -393,67 +466,60 @@ class GameEngine {
 
             else -> { // Centro Espacial (Future space / galaxy core)
                 levelGoalX = 4400f
-                // Spawn pad
-                platforms.add(Platform(Rect(0f, 460f, 450f, 600f), Color(0xFF263238))) // deep matte dark-grey
-                
-                // High distance floating pads
+                platforms.add(Platform(Rect(0f, 460f, 450f, 600f), Color(0xFF263238)))
+
                 platforms.add(Platform(Rect(550f, 410f, 700f, 430f), Color(0xFF18FFFF)))
                 platforms.add(Platform(Rect(800f, 340f, 950f, 360f), Color(0xFFFFE082)))
                 platforms.add(Platform(Rect(1050f, 270f, 1200f, 290f), Color(0xFF18FFFF)))
-                
-                // Falling trap bed (full spikes except moving platform)
+
                 platforms.add(Platform(Rect(1250f, 530f, 2400f, 600f), Color(0xFFFF5252), isSpiky = true))
-                
-                // Moving horizontal linking platform
-                platforms.add(Platform(
-                    rect = Rect(1300f, 340f, 1500f, 360f),
-                    color = Color(0xFFFFF176),
-                    movesHorizontally = true,
-                    travelRange = 150f,
-                    speed = 3f
-                ))
-                
-                // Floating high rock
+
+                platforms.add(
+                    Platform(
+                        rect = Rect(1300f, 340f, 1500f, 360f),
+                        color = Color(0xFFFFF176),
+                        movesHorizontally = true,
+                        travelRange = 150f,
+                        speed = 3f
+                    )
+                )
+
                 platforms.add(Platform(Rect(1900f, 300f, 2100f, 320f), Color(0xFF18FFFF)))
-                
-                // Another moving platform going up and down
-                platforms.add(Platform(
-                    rect = Rect(2160f, 420f, 2300f, 440f),
-                    color = Color(0xFFFFF176),
-                    movesVertically = true,
-                    travelRange = 150f,
-                    speed = 3.5f
-                ))
-                
-                // Giant space station reactor core
+
+                platforms.add(
+                    Platform(
+                        rect = Rect(2160f, 420f, 2300f, 440f),
+                        color = Color(0xFFFFF176),
+                        movesVertically = true,
+                        travelRange = 150f,
+                        speed = 3.5f
+                    )
+                )
+
                 platforms.add(Platform(Rect(2480f, 450f, 3200f, 600f), Color(0xFF263238)))
-                // Reactor beam center is hot spikes
                 platforms.add(Platform(Rect(2750f, 420f, 2950f, 451f), Color(0xFFFF1744), isSpiky = true))
-                
-                // High floating islands
+
                 platforms.add(Platform(Rect(2550f, 320f, 2700f, 340f), Color(0xFF311B92)))
                 platforms.add(Platform(Rect(3000f, 320f, 3150f, 340f), Color(0xFF311B92)))
 
-                // Long final jump sequence
                 platforms.add(Platform(Rect(3300f, 400f, 3450f, 420f), Color(0xFF18FFFF)))
                 platforms.add(Platform(Rect(3550f, 320f, 3700f, 340f), Color(0xFFFFF176)))
-                
-                // Safe dome at end
+
                 platforms.add(Platform(Rect(3850f, 420f, 4600f, 600f), Color(0xFF263238)))
 
                 // Add Collectibles
                 addCoin(301, 620f, 360f)
                 addCoin(302, 875f, 290f)
                 addCoin(303, 1125f, 220f)
-                
+
                 addDiamond(304, 1400f, 260f)
                 addDiamond(305, 2000f, 220f)
-                
-                addGravityBoots(306, 2625f, 260f) // Zero-gravity boots!
-                addDiamond(307, 2850f, 150f) // Float way high over the reactor beam!
+
+                addGravityBoots(306, 2625f, 260f)
+                addDiamond(307, 2850f, 150f)
                 addDiamond(308, 2850f, 100f)
                 addDiamond(309, 3075f, 260f)
-                
+
                 addHeart(310, 3950f, 350f)
                 addCoin(311, 4100f, 350f)
                 addCoin(312, 4200f, 350f)
@@ -502,7 +568,6 @@ class GameEngine {
 
     fun jump() {
         if (isGrounded) {
-            // Standard Jump
             val currentJumpPower = if (tempGravityBootsTimer > 0) jumpPower * 1.35f else jumpPower
             playerVy = currentJumpPower
             isGrounded = false
@@ -511,7 +576,6 @@ class GameEngine {
             addFloatingText("¡SALTO!", playerX + playerWidth / 2f, playerY, Color(0xFF00F0FF))
             onSoundEffect?.invoke(RetroSoundEffect.JUMP)
         } else if (doubleJumpAvailable) {
-            // Double Jump
             val currentJumpPower = if (tempGravityBootsTimer > 0) jumpPower * 1.25f else jumpPower * 0.9f
             playerVy = currentJumpPower
             doubleJumpAvailable = false
@@ -573,10 +637,48 @@ class GameEngine {
         screenShakeTimer = duration
     }
 
-    // THE PHYSICS STEP RUNS CONTINUOUSLY IN THE GAME TICK
-    fun updatePhysics() {
-        if (screenShakeTimer > 0) {
-            screenShakeTimer--
+    /**
+     * Frame-rate independent physics update.
+     * [deltaSeconds] is the elapsed wall-clock time since the previous frame (defaults to 1/60s).
+     * Sub-steps large deltas so collision detection and jump curves remain identical across all devices.
+     */
+    fun updatePhysics(deltaSeconds: Float = 1f / 60f) {
+        val totalStepScale = (deltaSeconds * 60f).coerceIn(0.05f, 4.0f)
+        var remaining = totalStepScale
+        while (remaining > 0.0001f) {
+            val dtScale = min(remaining, 1.0f)
+            stepPhysics(dtScale)
+            remaining -= dtScale
+            if (playerLives <= 0) break
+        }
+    }
+
+    private fun stepPhysics(dtScale: Float) {
+        timerTickAccumulator += dtScale
+        while (timerTickAccumulator >= 1.0f) {
+            timerTickAccumulator -= 1.0f
+            if (screenShakeTimer > 0) {
+                screenShakeTimer--
+            }
+            if (invincibilityFrames > 0) {
+                invincibilityFrames--
+            }
+            if (tempGravityBootsTimer > 0) {
+                tempGravityBootsTimer--
+                if (tempGravityBootsTimer % 4 == 0) {
+                    particles.add(
+                        Particle(
+                            x = playerX + playerWidth / 2f + (Random.nextFloat() - 0.5f) * playerWidth,
+                            y = playerY + playerHeight - 10f,
+                            vx = (Random.nextFloat() - 0.5f) * 2f,
+                            vy = 1f,
+                            color = Color(0xFFFFFF00),
+                            size = Random.nextFloat() * 4f + 2f,
+                            maxLife = 15
+                        )
+                    )
+                }
+            }
         }
 
         // Apply horizontal movement inputs
@@ -585,25 +687,24 @@ class GameEngine {
         if (isMovingRight) desiredVx += walkSpeed
         playerVx = desiredVx
 
-        // Apply Gravity
-        playerVy += gravity
-
-        // Update levels/platform animations
+        // Update levels/platform animations with delta time
         for (i in platforms.indices) {
-            platforms[i] = platforms[i].update()
+            platforms[i] = platforms[i].update(dtScale)
         }
 
-        // Update enemies
+        // Update enemies with delta time
         for (enemy in enemies) {
-            enemy.update()
+            enemy.update(dtScale)
         }
 
-        // Keep track of moving platform helper offsets (if riding one)
         var ridingPlatform: Platform? = null
 
-        // Update vertical position first for landing calculations
+        // Trapezoidal (Velocity Verlet) vertical integration for frame-rate invariant jump parabola
         val oldY = playerY
-        playerY += playerVy
+        val prevVy = playerVy
+        playerVy += gravity * dtScale
+        val avgVy = (prevVy + playerVy) * 0.5f
+        playerY += avgVy * dtScale
 
         // Collision logic
         isGrounded = false
@@ -611,23 +712,20 @@ class GameEngine {
 
         for (platform in platforms) {
             val pRect = platform.rect
-            
+
             // Check vertical collision (landing on top)
             if (playerRect.overlaps(pRect)) {
-                // If player was falling and is mostly above the platform top boundary
-                val wasAbove = oldY + playerHeight - 2f <= pRect.top + abs(platform.speed * 2)
+                val wasAbove = oldY + playerHeight - 2f <= pRect.top + abs(platform.speed * 2f)
                 if (playerVy > 0f && wasAbove) {
                     playerY = pRect.top - playerHeight
                     playerVy = 0f
                     isGrounded = true
                     doubleJumpAvailable = true
-                    
-                    // Ride horizontal/vertical assets
+
                     if (platform.movesHorizontally || platform.movesVertically) {
                         ridingPlatform = platform
                     }
-                    
-                    // Check if landed on spike platform
+
                     if (platform.isSpiky) {
                         playerHitByHazard()
                     }
@@ -635,34 +733,32 @@ class GameEngine {
             }
         }
 
-        // Update horizontal position next
-        playerX += playerVx
-        
+        // Update horizontal position next with delta time
+        playerX += playerVx * dtScale
+
         // Horizontal boundary checks
-        if (playerX < 0) playerX = 0f
+        if (playerX < 0f) playerX = 0f
         if (playerX > maxLevelWidth - playerWidth) playerX = maxLevelWidth - playerWidth
 
-        // Ride moving platform motion additions (horizontal)
+        // Ride moving platform motion additions
         if (ridingPlatform != null) {
             if (ridingPlatform.movesHorizontally) {
-                playerX += ridingPlatform.speed * ridingPlatform.direction
+                playerX += ridingPlatform.lastDeltaX
             }
             if (ridingPlatform.movesVertically) {
-                playerY += ridingPlatform.speed * ridingPlatform.direction
+                playerY += ridingPlatform.lastDeltaY
             }
         }
 
         // Re-check side collisions with solid platforms (to stop walk-thru actions)
         val playerRHorizontal = Rect(playerX, playerY, playerX + playerWidth, playerY + playerHeight)
         for (platform in platforms) {
-            if (platform.isSpiky) continue // Spikes shouldn't block laterally as physical walls
+            if (platform.isSpiky) continue
             val pRect = platform.rect
             if (playerRHorizontal.overlaps(pRect)) {
-                // Determine collision depth from both sides
                 val overlapLeft = (playerX + playerWidth) - pRect.left
                 val overlapRight = pRect.right - playerX
-                
-                // If vertically embedded, push out horizontally
+
                 if (playerY + playerHeight - 5f > pRect.top && playerY + 5f < pRect.bottom) {
                     if (overlapLeft < overlapRight) {
                         playerX -= overlapLeft
@@ -689,12 +785,14 @@ class GameEngine {
                 when (item.type) {
                     CollectibleType.COIN -> {
                         playerScore += 100
-                        addFloatingText("+100", item.x, item.y, Color(0xFFFFFF00))
+                        playerCoins += 100
+                        addFloatingText("+100 🪙", item.x, item.y, Color(0xFFFFFF00))
                         spawnExplosionParticles(item.x, item.y, Color(0xFFFFD700), 5)
                         onSoundEffect?.invoke(RetroSoundEffect.COIN)
                     }
                     CollectibleType.DIAMOND -> {
                         playerScore += 500
+                        playerCoins += 500
                         addFloatingText("+500 DIAMANTE", item.x, item.y, Color(0xFF00FFFF))
                         spawnExplosionParticles(item.x, item.y, Color(0xFF00E5FF), 8)
                         triggerScreenShake(4f, 5)
@@ -706,43 +804,25 @@ class GameEngine {
                             addFloatingText("+1 VIDA ❤️", item.x, item.y, Color(0xFFFF2A6D))
                         } else {
                             playerScore += 1000
+                            playerCoins += 250
                             addFloatingText("+1000 MAX SALUD", item.x, item.y, Color(0xFFFF2A6D))
                         }
                         spawnExplosionParticles(item.x, item.y, Color(0xFFFF2A6D), 8)
                         onSoundEffect?.invoke(RetroSoundEffect.POWERUP)
                     }
                     CollectibleType.GRAVITY_BOOTS -> {
-                        tempGravityBootsTimer = 350 // approx 6-7 seconds of high jump
+                        tempGravityBootsTimer = 350 // approx 6 seconds of high jump
                         addFloatingText("¡SUPERSALTO ACTIVO!", item.x, item.y, Color(0xFFFFF176))
                         spawnExplosionParticles(item.x, item.y, Color(0xFFFFEB3B), 10)
                         triggerScreenShake(5f, 8)
                         onSoundEffect?.invoke(RetroSoundEffect.POWERUP)
                     }
                 }
-                
-                // Update highscore
+
+                // Update highscore (Highscore only increases, never decreases!)
                 if (playerScore > playerHighscore) {
                     playerHighscore = playerScore
                 }
-            }
-        }
-
-        // Handle Active Power timers
-        if (tempGravityBootsTimer > 0) {
-            tempGravityBootsTimer--
-            // Spawn little trail sparkles
-            if (tempGravityBootsTimer % 4 == 0) {
-                particles.add(
-                    Particle(
-                        x = playerX + playerWidth / 2f + (Random.nextFloat() - 0.5f) * playerWidth,
-                        y = playerY + playerHeight - 10f,
-                        vx = (Random.nextFloat() - 0.5f) * 2f,
-                        vy = 1f,
-                        color = Color(0xFFFFFF00),
-                        size = Random.nextFloat() * 4f + 2f,
-                        maxLife = 15
-                    )
-                )
             }
         }
 
@@ -751,20 +831,22 @@ class GameEngine {
             if (enemy.isDead) continue
             val eRect = enemy.getBounds()
             if (playerRAll.overlaps(eRect)) {
-                // If player is falling downswards and lands on enemy's top head
                 val playerBottomY = oldY + playerHeight
                 val enemyTopLimitY = enemy.y + 12f
                 if (playerVy > 0f && playerBottomY <= enemyTopLimitY) {
                     // STOMP DEFEATED!
                     enemy.isDead = true
-                    playerVy = jumpPower * 0.75f // bounce up
+                    playerVy = jumpPower * 0.75f
                     playerScore += 300
+                    playerCoins += 150
+                    if (playerScore > playerHighscore) {
+                        playerHighscore = playerScore
+                    }
                     addFloatingText("+300 ¡STOMP!", enemy.x + enemy.width / 2f, enemy.y, Color(0xFF39FF14))
                     spawnExplosionParticles(enemy.x + enemy.width / 2f, enemy.y + enemy.height / 2f, enemy.color, 15)
                     triggerScreenShake(6f, 10)
                     onSoundEffect?.invoke(RetroSoundEffect.STOMP)
                 } else {
-                    // PLAYER HIT!
                     playerHitByHazard()
                 }
             }
@@ -780,26 +862,22 @@ class GameEngine {
             levelComplete()
         }
 
-        // Diminish invincibility frames
-        if (invincibilityFrames > 0) {
-            invincibilityFrames--
-        }
-
-        // Camera scroll logic centered on player X and Y
+        // Frame-rate independent exponential camera smoothing
+        val camLerp = 1f - (1f - 0.12f).pow(dtScale)
         val targetCamX = playerX - viewportWidth * 0.32f
-        cameraX += (targetCamX - cameraX) * 0.12f
+        cameraX += (targetCamX - cameraX) * camLerp
         val maxCameraLimit = (maxLevelWidth - viewportWidth).coerceAtLeast(0f)
         if (cameraX < 0f) cameraX = 0f
         if (cameraX > maxCameraLimit) cameraX = maxCameraLimit
 
-        val maxCamY = virtualHeight - virtualViewportHeight // 150f aligns 600f world bottom to screen bottom
+        val maxCamY = virtualHeight - virtualViewportHeight
         val targetCamY = (playerY - 220f).coerceIn(-30f, maxCamY)
-        cameraY += (targetCamY - cameraY) * 0.12f
+        cameraY += (targetCamY - cameraY) * camLerp
 
         // Cycle aesthetic particles
         val nextParticles = mutableListOf<Particle>()
         for (p in particles) {
-            val updated = p.update()
+            val updated = p.update(dtScale)
             if (updated != null) nextParticles.add(updated)
         }
         particles = nextParticles
@@ -807,7 +885,7 @@ class GameEngine {
         // Cycle floating texts
         val nextTexts = mutableListOf<FloatingText>()
         for (t in floatingTexts) {
-            val updated = t.update()
+            val updated = t.update(dtScale)
             if (updated != null) nextTexts.add(updated)
         }
         floatingTexts = nextTexts
@@ -815,22 +893,22 @@ class GameEngine {
 
     private fun playerHitByHazard() {
         if (invincibilityFrames > 0) return
-        
+
         playerLives--
         triggerScreenShake(12f, 18)
-        
+
         if (playerLives <= 0) {
             playerLives = 0
-            spawnExplosionParticles(playerX + playerWidth/2, playerY + playerHeight/2, Color(0xFFFF007F), 25)
+            spawnExplosionParticles(playerX + playerWidth / 2, playerY + playerHeight / 2, Color(0xFFFF007F), 25)
             addFloatingText("¡FIN DEL JUEGO!", playerX, playerY, Color(0xFFFF007F))
             onSoundEffect?.invoke(RetroSoundEffect.COLLISION)
             onSoundEffect?.invoke(RetroSoundEffect.GAME_OVER)
         } else {
             invincibilityFrames = 60 // 1 second of flashing immunity
-            playerVy = -8f // small pushback bounce up
+            playerVy = -8f
             playerVx = if (isMovingLeft) 5f else -5f
             addFloatingText("-1 VIDA", playerX, playerY - 30f, Color(0xFFFF0000))
-            spawnExplosionParticles(playerX + playerWidth/2, playerY + playerHeight/2, Color(0xFFFF0000), 10)
+            spawnExplosionParticles(playerX + playerWidth / 2, playerY + playerHeight / 2, Color(0xFFFF0000), 10)
             onSoundEffect?.invoke(RetroSoundEffect.COLLISION)
         }
     }
@@ -844,13 +922,10 @@ class GameEngine {
     private fun levelComplete() {
         onSoundEffect?.invoke(RetroSoundEffect.LEVEL_COMPLETE)
         if (currentLevelIndex < 2) {
-            // Unlocked next level automatically
-            // Give victory splash but keep playing next
             addFloatingText("¡NIVEL COMPLETADO!", playerX, playerY, Color(0xFF39FF14))
             loadLevel(currentLevelIndex + 1)
         } else {
-            // Beat the final level!
-            // Change Game state to VICTORY
+            // Beat the final level! GameView transitions to VICTORY
         }
     }
 }

@@ -6,3 +6,12 @@ plugins {
   alias(libs.plugins.roborazzi) apply false
   alias(libs.plugins.secrets) apply false
 }
+
+// Automatically materialize debug.keystore from debug.keystore.base64 on freshly cloned machines
+val debugKeystoreFile = file("debug.keystore")
+val debugKeystoreBase64File = file("debug.keystore.base64")
+if (!debugKeystoreFile.exists() && debugKeystoreBase64File.exists()) {
+  val decodedBytes = java.util.Base64.getMimeDecoder().decode(debugKeystoreBase64File.readText())
+  debugKeystoreFile.writeBytes(decodedBytes)
+}
+
