@@ -1,0 +1,6 @@
+{
+  "name": "Aventura Retro",
+  "description": "Un fantástico juego de plataformas retro con múltiples niveles, controles multi-touch fluidos y física clásica.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

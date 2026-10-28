@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#0D061A"
+        android:pathData="M0,0h108v108h-108z" />
+    <!-- Neon horizon lines -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FF00A0"
+        android:strokeWidth="0.8"
+        android:pathData="M0,65 L108,65 M0,75 L108,75 M0,88 L108,88 M0,102 L108,102" />
+    <!-- Perspective lines -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#00F0FF"
+        android:strokeWidth="0.8"
+        android:pathData="M54,55 L10,108 M54,55 L32,108 M54,55 L54,108 M54,55 L76,108 M54,55 L98,108" />
+</vector>
